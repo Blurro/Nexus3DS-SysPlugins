@@ -57,6 +57,7 @@ PLUGIN_BSS(blur) static u32 g_blurMenuDrawOriginal1;
 PLUGIN_BSS(blur) static bool g_blurMenuDrawInstalled;
 PLUGIN_DATA(blur) static bool g_blurSleepIoAllowed = true;
 PLUGIN_DATA(blur) static u32 g_blurSleepReplyTarget;
+PLUGIN_DATA(blur) static u32 g_blurSleepReplyReturnAddr;
 PLUGIN_BSS(blur) static volatile s32 g_blurSleepIoLock;
 PLUGIN_BSS(blur) static u32 g_blurSleepIoUsers;
 PLUGIN_BSS(blur) static u32 g_blurSleepCycleCounter;
@@ -296,11 +297,23 @@ PLUGIN_CODE(blur) static bool PLUGIN_blur_CloseSleepIo(void)
     return false;
 }
 
-PLUGIN_CODE(blur) static Result PLUGIN_blur_SleepReplyHook(bool deny)
+PLUGIN_CODE(blur) static Result PLUGIN_blur_SleepReplyHookBody(bool deny)
 {
     bool drained = PLUGIN_blur_CloseSleepIo();
     Result (*reply)(bool) = (Result(*)(bool))g_blurSleepReplyTarget;
     return reply ? reply(deny || !drained) : (Result)-1;
+}
+
+PLUGIN_CODE(blur) __attribute__((naked)) static void PLUGIN_blur_SleepReplyHook(void)
+{
+    __asm__ volatile(
+        "bl PLUGIN_blur_SleepReplyHookBody\n"
+        "pop {r4, lr}\n"
+        "ldr r12, 1f\n"
+        "ldr pc, [r12]\n"
+        "1:\n"
+        ".word g_blurSleepReplyReturnAddr\n"
+    );
 }
 
 PLUGIN_CODE(blur) static bool PLUGIN_blur_MatchSleepReplySite(
@@ -329,8 +342,8 @@ PLUGIN_CODE(blur) static bool PLUGIN_blur_MatchSleepReplySite(
 
 PLUGIN_CODE(blur) static bool PLUGIN_blur_InstallSleepReplyHook(
     u32 *addressOut,
-    u32 *originalOut,
-    u32 *patchedOut
+    u32 *original0Out,
+    u32 *original1Out
 )
 {
     u32 marker = BLUR_HOST__blur_marker_menudraw_start;
@@ -354,56 +367,34 @@ PLUGIN_CODE(blur) static bool PLUGIN_blur_InstallSleepReplyHook(
     if (matches != 1u)
         return false;
 
-    u32 original = *(volatile u32*)found;
+    u32 original0 = *(volatile u32*)found;
+    u32 original1 = *(volatile u32*)(found + 4u);
     u32 target = 0;
-    if (!PLUGIN_blur_DecodeArmBranch(original, found, &target))
+    if (!PLUGIN_blur_DecodeArmBranch(original0, found, &target) ||
+        original1 != 0xE8BD4010u)
+    {
         return false;
+    }
 
-    s64 delta = (s64)(u32)PLUGIN_blur_SleepReplyHook - (s64)(found + 8u);
-    if ((delta & 3) || delta < -0x02000000LL || delta > 0x01FFFFFCLL)
-        return false;
-
-    u32 patched = 0xEB000000u | (((u32)(delta >> 2)) & 0x00FFFFFFu);
     u32 mapBase = 0;
     u32 mappedAddress = 0;
     if (!BLUR_MENU__MapPage(CUR_PROCESS_HANDLE, found, &mapBase, &mappedAddress))
         return false;
-    if (*(volatile u32*)mappedAddress != original)
+    if (*(volatile u32*)mappedAddress != original0 ||
+        *(volatile u32*)(mappedAddress + 4u) != original1)
     {
         BLUR_MENU__UnmapPage(mapBase);
         return false;
     }
 
     g_blurSleepReplyTarget = target;
-    *(volatile u32*)mappedAddress = patched;
+    g_blurSleepReplyReturnAddr = found + 8u;
+    *(volatile u32*)(mappedAddress + 4u) = (u32)PLUGIN_blur_SleepReplyHook;
+    *(volatile u32*)mappedAddress = 0xE51FF004u;
     BLUR_MENU__UnmapPage(mapBase);
     *addressOut = found;
-    *originalOut = original;
-    *patchedOut = patched;
-    return true;
-}
-
-PLUGIN_CODE(blur) static bool PLUGIN_blur_RestoreHostWord(
-    u32 address,
-    u32 expectedHook,
-    u32 original
-)
-{
-    u32 mapBase = 0;
-    u32 mappedAddress = 0;
-    if (!BLUR_MENU__MapPage(CUR_PROCESS_HANDLE, address, &mapBase, &mappedAddress))
-        return false;
-
-    u32 current = *(volatile u32*)mappedAddress;
-    if (current != original && current != expectedHook)
-    {
-        BLUR_MENU__UnmapPage(mapBase);
-        return false;
-    }
-
-    if (current == expectedHook)
-        *(volatile u32*)mappedAddress = original;
-    BLUR_MENU__UnmapPage(mapBase);
+    *original0Out = original0;
+    *original1Out = original1;
     return true;
 }
 
@@ -525,8 +516,8 @@ typedef struct
     u32 leave0;
     u32 leave1;
     u32 sleepAddress;
-    u32 sleepOriginal;
-    u32 sleepPatched;
+    u32 sleepOriginal0;
+    u32 sleepOriginal1;
 } BlurHookState;
 
 #define BLUR_HOOK_DRAW  (1u << 0)
@@ -545,10 +536,11 @@ PLUGIN_CODE(blur) static bool PLUGIN_blur_RollBackHooks(const BlurHookState *sta
     bool restored = true;
 
     if ((state->installed & BLUR_HOOK_SLEEP) &&
-        !PLUGIN_blur_RestoreHostWord(
+        !PLUGIN_blur_RestoreHostWords(
             state->sleepAddress,
-            state->sleepPatched,
-            state->sleepOriginal))
+            (u32)PLUGIN_blur_SleepReplyHook,
+            state->sleepOriginal0,
+            state->sleepOriginal1))
     {
         restored = false;
     }
@@ -629,8 +621,8 @@ PLUGIN_MAIN(blur) bool PLUGIN_blur_Main(void)
 
     if (!PLUGIN_blur_InstallSleepReplyHook(
             &state.sleepAddress,
-            &state.sleepOriginal,
-            &state.sleepPatched))
+            &state.sleepOriginal0,
+            &state.sleepOriginal1))
     {
         goto fail;
     }
